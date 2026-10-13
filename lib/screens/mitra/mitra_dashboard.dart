@@ -1,7 +1,9 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../theme.dart';
 import '../../widgets.dart';
@@ -27,6 +29,31 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
   final List<MitraOrder> incomingOrders = [];
   final List<MitraOrder> activeOrders = [];
 
+  // Data dari Supabase. `_live == false` → mode demo (Supabase belum
+  // dikonfigurasi / belum login), UI memakai contoh bawaan di bawah.
+  bool _live = false;
+  String? _uid;
+  double _rating = 0;
+  int _earnings = 0;
+  String _bio = '';
+  List<String> _badges = const [];
+  List<Map<String, dynamic>> _schedules = const [];
+  List<Map<String, dynamic>> _quickReplies = const [];
+  List<Map<String, dynamic>> _services = const [];
+
+  String get displayName => _live ? _mitraBusinessName : 'Pak Rudi AC';
+  double get rating => _live ? _rating : 4.9;
+  String get earningsLabel => _live ? rupiah(_earnings) : 'Rp2,4jt';
+  String get bio => _live
+      ? (_bio.isEmpty ? 'Belum ada bio.' : _bio)
+      : 'Teknisi AC area Tebet dengan pengalaman 7 tahun. Fokus cuci AC, AC bocor, isi freon, dan perawatan rutin rumah.';
+  List<String> get badges => _live ? _badges : const ['Terverifikasi'];
+  List<Map<String, dynamic>>? get services => _live ? _services : null;
+  List<Map<String, dynamic>> get schedules =>
+      _live ? _schedules : _demoSchedules;
+  List<Map<String, dynamic>> get quickReplies =>
+      _live ? _quickReplies : _demoQuickReplies;
+
   @override
   void initState() {
     super.initState();
@@ -34,45 +61,64 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
   }
 
   Future<void> _loadDashboard() async {
+    final SupabaseClient client;
     try {
-      final client = Supabase.instance.client;
-      final authUid = client.auth.currentUser?.id;
-      if (authUid == null) return;
-
-      final userRows = await client
-          .from('users')
-          .select('user_id, name')
-          .eq('auth_user_id', authUid)
-          .limit(1);
-      if (userRows.isEmpty) return;
-
-      final userId = userRows.first['user_id'] as String;
-      final userName = userRows.first['name'] as String? ?? '';
-
-      final mitraRows = await client
-          .from('mitras')
-          .select('verification_status, avg_rating')
-          .eq('mitra_id', userId)
-          .limit(1);
-
-      final verificationStatus = mitraRows.isNotEmpty
-          ? mitraRows.first['verification_status'] as String? ?? ''
-          : '';
-
-      final bookingRows = await client
-          .from('bookings')
-          .select(
-            'id, problem, category, address, schedule, customer_id, '
-            'estimated_price_min, estimated_price_max, final_price, status, ai_summary',
-          )
-          .eq('worker_id', userId)
-          .inFilter('status', [
-            'created',
-            'accepted',
-            'on_the_way',
-            'in_progress',
-          ])
-          .order('created_at', ascending: false);
+      client = Supabase.instance.client;
+    } catch (_) {
+      return; // demo tanpa Supabase
+    }
+    // auth uid = users.user_id = mitras.mitra_id (lihat migration).
+    final userId = client.auth.currentUser?.id;
+    if (userId == null) return;
+    try {
+      final now = DateTime.now();
+      final monthStart = DateTime(
+        now.year,
+        now.month,
+      ).toUtc().toIso8601String();
+      final results = await Future.wait<dynamic>([
+        client.from('users').select('name').eq('user_id', userId).maybeSingle(),
+        client
+            .from('mitras')
+            .select(
+              'verification_status, is_available, avg_rating, bio, '
+              'mitra_badges(badges(badge_name)), '
+              'mitra_schedules(day_name, start_time, end_time), '
+              'mitra_quick_replies(id, title, body, sort_order), '
+              'mitra_services(service_name, price_min, price_max)',
+            )
+            .eq('mitra_id', userId)
+            .maybeSingle(),
+        client
+            .from('bookings')
+            .select(
+              'id, problem, category, address, schedule, customer_id, '
+              'estimated_price_min, estimated_price_max, final_price, status, ai_summary',
+            )
+            .eq('worker_id', userId)
+            .inFilter('status', [
+              'created',
+              'accepted',
+              'on_the_way',
+              'in_progress',
+            ])
+            .order('created_at', ascending: false),
+        // ponytail: belum ada kolom completed_at; updated_at = perkiraan
+        // kapan order selesai. Tambah kolom kalau laporan keuangan butuh akurat.
+        client
+            .from('bookings')
+            .select('final_price')
+            .eq('worker_id', userId)
+            .inFilter('status', ['completed', 'reviewed'])
+            .gte('updated_at', monthStart),
+      ]);
+      final userName = (results[0] as Map?)?['name'] as String? ?? '';
+      final mitra = results[1] as Map<String, dynamic>?;
+      final bookingRows = results[2] as List;
+      final earnedRows = results[3] as List;
+      final verificationStatus = mitra?['verification_status'] as String? ?? '';
+      List<Map<String, dynamic>> rows(String key) =>
+          List<Map<String, dynamic>>.from(mitra?[key] as List? ?? const []);
 
       final incoming = <MitraOrder>[];
       final active = <MitraOrder>[];
@@ -87,9 +133,31 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
 
       if (!mounted) return;
       setState(() {
+        _live = true;
+        _uid = userId;
         isVerified = verificationStatus == 'approved';
+        isAvailable = mitra?['is_available'] as bool? ?? true;
+        _rating = (mitra?['avg_rating'] as num?)?.toDouble() ?? 0;
+        _bio = mitra?['bio'] as String? ?? '';
+        _earnings = earnedRows.fold<int>(
+          0,
+          (sum, r) => sum + ((r['final_price'] as num?)?.toInt() ?? 0),
+        );
+        _badges = [
+          for (final b in rows('mitra_badges'))
+            if ((b['badges'] as Map?)?['badge_name'] case final String name)
+              name,
+        ];
+        _schedules = rows('mitra_schedules');
+        _quickReplies = rows('mitra_quick_replies')
+          ..sort(
+            (a, b) => (a['sort_order'] as int? ?? 0).compareTo(
+              b['sort_order'] as int? ?? 0,
+            ),
+          );
+        _services = rows('mitra_services');
         _mitraName = userName.split(' ').first;
-        _mitraBusinessName = userName;
+        _mitraBusinessName = userName.isEmpty ? 'Mitra Beresin' : userName;
         incomingOrders
           ..clear()
           ..addAll(incoming);
@@ -97,7 +165,223 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
           ..clear()
           ..addAll(active);
       });
-    } catch (_) {}
+    } catch (_) {
+      if (mounted) showToast('Gagal memuat data mitra. Coba buka ulang.');
+    }
+  }
+
+  /// Tulis ke Supabase lalu muat ulang dashboard. Gagal → toast, lalu tetap
+  /// dimuat ulang supaya UI kembali sinkron dengan database.
+  Future<void> _write(
+    Future<void> Function(SupabaseClient client, String uid) op,
+  ) async {
+    if (!_live || _uid == null) {
+      showToast('Mode demo: perubahan tidak disimpan.');
+      return;
+    }
+    try {
+      await op(Supabase.instance.client, _uid!);
+    } catch (_) {
+      if (mounted) showToast('Gagal menyimpan. Cek koneksi lalu coba lagi.');
+    }
+    await _loadDashboard();
+  }
+
+  void setAvailable(bool value) {
+    setState(() => isAvailable = value);
+    if (!_live) return;
+    unawaited(
+      _write(
+        (c, uid) => c
+            .from('mitras')
+            .update({'is_available': value})
+            .eq('mitra_id', uid),
+      ),
+    );
+  }
+
+  Future<String?> _pickAction(
+    String title,
+    String? message,
+    List<(String, String, bool)> actions,
+  ) {
+    return showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _BottomSheetShell(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              title,
+              style: pj(
+                fontSize: 18,
+                fontWeight: FontWeight.w900,
+                color: AppColors.ink,
+              ),
+            ),
+            if (message != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                message,
+                style: pj(fontSize: 13, color: AppColors.ink2, height: 1.45),
+              ),
+            ],
+            const SizedBox(height: 14),
+            for (final (key, label, primary) in actions) ...[
+              BrButton(
+                label: label,
+                full: true,
+                variant: primary
+                    ? BrButtonVariant.primary
+                    : BrButtonVariant.secondary,
+                onPressed: () => Navigator.pop(ctx, key),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> editScheduleDay(String day) async {
+    final current = schedules.where((s) => s['day_name'] == day).firstOrNull;
+    final action = await _pickAction('Jam kerja $day', null, const [
+      ('set', 'Atur Jam Kerja', true),
+      ('off', 'Jadikan Libur', false),
+    ]);
+    if (!mounted || action == null) return;
+    if (action == 'off') {
+      return _write(
+        (c, uid) => c
+            .from('mitra_schedules')
+            .delete()
+            .eq('mitra_id', uid)
+            .eq('day_name', day),
+      );
+    }
+    final start = await showTimePicker(
+      context: context,
+      helpText: 'Jam mulai $day',
+      initialTime:
+          _parseTime(current?['start_time']) ??
+          const TimeOfDay(hour: 8, minute: 0),
+    );
+    if (!mounted || start == null) return;
+    final end = await showTimePicker(
+      context: context,
+      helpText: 'Jam selesai $day',
+      initialTime:
+          _parseTime(current?['end_time']) ??
+          const TimeOfDay(hour: 17, minute: 0),
+    );
+    if (!mounted || end == null) return;
+    if (end.hour * 60 + end.minute <= start.hour * 60 + start.minute) {
+      showToast('Jam selesai harus setelah jam mulai.');
+      return;
+    }
+    await _write(
+      (c, uid) => c.from('mitra_schedules').upsert({
+        'mitra_id': uid,
+        'day_name': day,
+        'start_time': _hhmm(start, ':'),
+        'end_time': _hhmm(end, ':'),
+      }, onConflict: 'mitra_id,day_name'),
+    );
+  }
+
+  Future<void> openQuickReply(Map<String, dynamic> reply) async {
+    final body = reply['body'] as String? ?? '';
+    final action =
+        await _pickAction(reply['title'] as String? ?? '', body, const [
+          ('wa', 'Kirim via WhatsApp', true),
+          ('copy', 'Salin', false),
+          ('edit', 'Edit', false),
+          ('delete', 'Hapus', false),
+        ]);
+    if (!mounted) return;
+    switch (action) {
+      case 'wa':
+        // Tanpa nomor → WhatsApp menampilkan pilihan chat. Mitra memang tidak
+        // bisa membaca nomor customer (RLS tabel users).
+        await launchUrl(
+          Uri.https('wa.me', '/', {'text': body}),
+          mode: LaunchMode.externalApplication,
+        );
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: body));
+        showToast('Balasan disalin.');
+      case 'edit':
+        await editQuickReply(reply);
+      case 'delete':
+        await _write(
+          (c, _) => c
+              .from('mitra_quick_replies')
+              .delete()
+              .eq('id', reply['id'] as Object),
+        );
+    }
+  }
+
+  Future<void> editQuickReply([Map<String, dynamic>? reply]) async {
+    final title = TextEditingController(text: reply?['title'] as String?);
+    final body = TextEditingController(text: reply?['body'] as String?);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+          reply == null ? 'Tambah Balasan Cepat' : 'Edit Balasan Cepat',
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: title,
+              decoration: const InputDecoration(labelText: 'Judul'),
+            ),
+            TextField(
+              controller: body,
+              minLines: 3,
+              maxLines: 6,
+              decoration: const InputDecoration(labelText: 'Isi pesan'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Batal'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Simpan'),
+          ),
+        ],
+      ),
+    );
+    final t = title.text.trim(), b = body.text.trim();
+    title.dispose();
+    body.dispose();
+    if (ok != true || !mounted) return;
+    if (t.isEmpty || b.isEmpty) {
+      showToast('Judul dan isi pesan wajib diisi.');
+      return;
+    }
+    await _write(
+      (c, uid) => reply == null
+          ? c.from('mitra_quick_replies').insert({
+              'mitra_id': uid,
+              'title': t,
+              'body': b,
+              'sort_order': _quickReplies.length + 1,
+            })
+          : c
+                .from('mitra_quick_replies')
+                .update({'title': t, 'body': b})
+                .eq('id', reply['id'] as Object),
+    );
   }
 
   MitraOrder _bookingToOrder(Map<String, dynamic> row) {
@@ -111,10 +395,9 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
     final location = addr.contains(',') ? addr.split(',').first.trim() : addr;
     return MitraOrder(
       bookingId: (row['id'] as String?) ?? '',
-      service:
-          (row['problem'] as String?)?.isNotEmpty == true
-              ? row['problem'] as String
-              : (row['category'] as String?) ?? '',
+      service: (row['problem'] as String?)?.isNotEmpty == true
+          ? row['problem'] as String
+          : (row['category'] as String?) ?? '',
       location: location.isEmpty ? '-' : location,
       distance: '-',
       estimate: priceLabel,
@@ -146,12 +429,14 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
       detailOrder = null;
       selectedTab = 0;
     });
-    if (order.bookingId.isNotEmpty) {
+    if (_live && order.bookingId.isNotEmpty) {
       unawaited(
-        Supabase.instance.client.from('bookings').update({
-          'status': 'accepted',
-          'updated_at': DateTime.now().toIso8601String(),
-        }).eq('id', order.bookingId),
+        _write(
+          (c, _) => c
+              .from('bookings')
+              .update({'status': 'accepted'})
+              .eq('id', order.bookingId),
+        ),
       );
     }
     showModalBottomSheet<void>(
@@ -188,12 +473,14 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
 
   void declineOrder(MitraOrder order) {
     setState(() => incomingOrders.remove(order));
-    if (order.bookingId.isNotEmpty) {
+    if (_live && order.bookingId.isNotEmpty) {
       unawaited(
-        Supabase.instance.client.from('bookings').update({
-          'status': 'cancelled',
-          'updated_at': DateTime.now().toIso8601String(),
-        }).eq('id', order.bookingId),
+        _write(
+          (c, _) => c
+              .from('bookings')
+              .update({'status': 'cancelled'})
+              .eq('id', order.bookingId),
+        ),
       );
     }
     showToast('Order ditolak. Kami akan carikan Mitra lain.');
@@ -295,62 +582,131 @@ class _MitraDashboardScreenState extends State<MitraDashboardScreen> {
       );
     }
 
-    return Scaffold(
-      backgroundColor: AppColors.bg,
-      body: _PhoneBody(
-        child: IndexedStack(
-          index: selectedTab,
-          children: [
-            _DashboardTab(
-              isVerified: isVerified,
-              onToggleState: (value) {
-                setState(() {
-                  isVerified = value;
-                  selectedTab = 0;
-                });
-              },
-              isAvailable: isAvailable,
-              onAvailabilityChanged: (value) =>
-                  setState(() => isAvailable = value),
-              availabilityIndex: availabilityIndex,
-              onAvailabilityOption: (index) =>
-                  setState(() => availabilityIndex = index),
-              incomingOrders: incomingOrders,
-              activeOrders: activeOrders,
-              onOpenDetail: (order) => setState(() => detailOrder = order),
-              onAccept: confirmAccept,
-              onDecline: declineOrder,
-              onProfile: () => setState(() => selectedTab = 3),
-              onSupport: () => setState(() => selectedTab = 4),
-              onEditRegistration: () => widget.go('workerReview'),
-              onSchedule: () => setState(() => selectedTab = 2),
-              onPrices: () => showToast('Pengaturan harga dibuka.'),
-              mitraName: _mitraName,
-              businessName: _mitraBusinessName,
-            ),
-            _OrdersTab(
-              incomingOrders: incomingOrders,
-              activeOrders: activeOrders,
-              onOpenDetail: (order) => setState(() => detailOrder = order),
-              onAccept: confirmAccept,
-              onDecline: declineOrder,
-              onArea: () => showToast('Pengaturan area layanan dibuka.'),
-            ),
-            _ScheduleTab(),
-            _MitraProfileTab(
-              onAction: showToast,
-              onLogout: () => _showMitraLogoutSheet(context),
-            ),
-            _SupportTab(onChat: () => showToast('Chat Support dibuka.')),
-          ],
+    return _MitraScope(
+      state: this,
+      child: Scaffold(
+        backgroundColor: AppColors.bg,
+        body: _PhoneBody(
+          child: IndexedStack(
+            index: selectedTab,
+            children: [
+              _DashboardTab(
+                isVerified: isVerified,
+                onToggleState: _live
+                    ? null
+                    : (value) {
+                        setState(() {
+                          isVerified = value;
+                          selectedTab = 0;
+                        });
+                      },
+                isAvailable: isAvailable,
+                onAvailabilityChanged: setAvailable,
+                availabilityIndex: availabilityIndex,
+                onAvailabilityOption: (index) =>
+                    setState(() => availabilityIndex = index),
+                incomingOrders: incomingOrders,
+                activeOrders: activeOrders,
+                onOpenDetail: (order) => setState(() => detailOrder = order),
+                onAccept: confirmAccept,
+                onDecline: declineOrder,
+                onProfile: () => setState(() => selectedTab = 3),
+                onSupport: () => setState(() => selectedTab = 4),
+                onEditRegistration: () => widget.go('workerReview'),
+                onSchedule: () => setState(() => selectedTab = 2),
+                onPrices: () => showToast('Pengaturan harga dibuka.'),
+                mitraName: _mitraName,
+                businessName: _mitraBusinessName,
+              ),
+              _OrdersTab(
+                incomingOrders: incomingOrders,
+                activeOrders: activeOrders,
+                onOpenDetail: (order) => setState(() => detailOrder = order),
+                onAccept: confirmAccept,
+                onDecline: declineOrder,
+                onArea: () => showToast('Pengaturan area layanan dibuka.'),
+              ),
+              const _ScheduleTab(),
+              _MitraProfileTab(
+                onAction: showToast,
+                onLogout: () => _showMitraLogoutSheet(context),
+              ),
+              _SupportTab(onChat: () => showToast('Chat Support dibuka.')),
+            ],
+          ),
         ),
-      ),
-      bottomNavigationBar: _MitraBottomNav(
-        activeIndex: selectedTab,
-        onTap: (index) => setState(() => selectedTab = index),
+        bottomNavigationBar: _MitraBottomNav(
+          activeIndex: selectedTab,
+          onTap: (index) => setState(() => selectedTab = index),
+        ),
       ),
     );
   }
+}
+
+/// Akses data & aksi dashboard dari widget anak tanpa oper parameter berlapis.
+class _MitraScope extends InheritedWidget {
+  final _MitraDashboardScreenState state;
+
+  const _MitraScope({required this.state, required super.child});
+
+  static _MitraDashboardScreenState of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_MitraScope>()!.state;
+
+  @override
+  bool updateShouldNotify(_MitraScope oldWidget) => true;
+}
+
+const _weekDays = [
+  'Senin',
+  'Selasa',
+  'Rabu',
+  'Kamis',
+  'Jumat',
+  'Sabtu',
+  'Minggu',
+];
+
+final _demoSchedules = <Map<String, dynamic>>[
+  for (final d in ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat'])
+    {'day_name': d, 'start_time': '08:00', 'end_time': '18:00'},
+  {'day_name': 'Sabtu', 'start_time': '09:00', 'end_time': '15:00'},
+];
+
+const _demoQuickReplies = <Map<String, dynamic>>[
+  {
+    'title': 'Terima order',
+    'body':
+        'Halo, order Anda sudah saya terima. Saya akan datang sesuai jadwal.',
+  },
+  {
+    'title': 'Konfirmasi harga',
+    'body':
+        'Setelah dicek, harga final pekerjaan ini Rp{harga}. Apakah disetujui sebelum saya mulai?',
+  },
+  {
+    'title': 'Info terlambat',
+    'body':
+        'Mohon maaf, saya sedikit terlambat. Perkiraan tiba {menit} menit lagi.',
+  },
+];
+
+TimeOfDay? _parseTime(Object? value) {
+  final parts = '${value ?? ''}'.split(RegExp('[:.]'));
+  if (parts.length < 2) return null;
+  final h = int.tryParse(parts[0]), m = int.tryParse(parts[1]);
+  return h == null || m == null ? null : TimeOfDay(hour: h, minute: m);
+}
+
+String _hhmm(TimeOfDay t, [String sep = '.']) =>
+    '${t.hour.toString().padLeft(2, '0')}$sep${t.minute.toString().padLeft(2, '0')}';
+
+String? _scheduleLabel(List<Map<String, dynamic>> schedules, String day) {
+  final row = schedules.where((s) => s['day_name'] == day).firstOrNull;
+  final start = _parseTime(row?['start_time']);
+  final end = _parseTime(row?['end_time']);
+  if (start == null || end == null) return null; // libur
+  return '${_hhmm(start)}-${_hhmm(end)}';
 }
 
 class MitraOrder {
@@ -385,7 +741,7 @@ class MitraOrder {
 
 class _DashboardTab extends StatelessWidget {
   final bool isVerified;
-  final ValueChanged<bool> onToggleState;
+  final ValueChanged<bool>? onToggleState;
   final bool isAvailable;
   final ValueChanged<bool> onAvailabilityChanged;
   final int availabilityIndex;
@@ -465,7 +821,8 @@ class _DashboardTab extends StatelessWidget {
 
 class _MitraHeader extends StatelessWidget {
   final bool isVerified;
-  final ValueChanged<bool> onToggleState;
+  final ValueChanged<bool>?
+  onToggleState; // null = data asli, sembunyikan switch demo
   final Widget trailing;
   final String mitraName;
   final String businessName;
@@ -509,8 +866,10 @@ class _MitraHeader extends StatelessWidget {
             trailing,
           ],
         ),
-        const SizedBox(height: 14),
-        _DemoStateSwitch(isVerified: isVerified, onChanged: onToggleState),
+        if (onToggleState case final onChanged?) ...[
+          const SizedBox(height: 14),
+          _DemoStateSwitch(isVerified: isVerified, onChanged: onChanged),
+        ],
       ],
     );
   }
@@ -945,11 +1304,12 @@ class _WorkerIdentityCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final mitra = _MitraScope.of(context);
     return BrCard(
       padding: const EdgeInsets.all(14),
       child: Row(
         children: [
-          const Avatar(name: 'Pak Rudi AC', size: 54),
+          Avatar(name: mitra.displayName, size: 54),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
@@ -959,7 +1319,7 @@ class _WorkerIdentityCard extends StatelessWidget {
                   children: [
                     Expanded(
                       child: Text(
-                        'Pak Rudi AC',
+                        mitra.displayName,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: pj(
@@ -980,7 +1340,11 @@ class _WorkerIdentityCard extends StatelessWidget {
                   children: [
                     _TinyMeta(icon: Icons.ac_unit_rounded, text: serviceLine),
                     _TinyMeta(icon: Icons.place_outlined, text: areaLine),
-                    if (showRating) const Stars(value: 4.9, size: 12),
+                    if (showRating) ...[
+                      Stars(value: mitra.rating, size: 12),
+                      for (final b in mitra.badges)
+                        if (b != statusLabel) BrTag(label: b, color: 'success'),
+                    ],
                   ],
                 ),
               ],
@@ -1087,11 +1451,16 @@ class _StatsGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final mitra = _MitraScope.of(context);
     final stats = [
       ['Order Baru', '$incoming', Icons.notifications_active_rounded],
       ['Order Aktif', '$active', Icons.handyman_rounded],
-      ['Rating', '4.9', Icons.star_rounded],
-      ['Pendapatan Bulan Ini', 'Rp2,4jt', Icons.account_balance_wallet_rounded],
+      ['Rating', mitra.rating.toStringAsFixed(1), Icons.star_rounded],
+      [
+        'Pendapatan Bulan Ini',
+        mitra.earningsLabel,
+        Icons.account_balance_wallet_rounded,
+      ],
     ];
     return GridView.builder(
       shrinkWrap: true,
@@ -1502,9 +1871,25 @@ class _PricingCard extends StatelessWidget {
             style: pj(fontSize: 13, color: AppColors.ink2, height: 1.45),
           ),
           const SizedBox(height: 14),
-          const _PriceRow(label: 'Cuci AC', value: 'Rp80.000-Rp120.000'),
-          const _PriceRow(label: 'Cek AC bocor', value: 'Rp100.000-Rp150.000'),
-          const _PriceRow(label: 'Isi freon', value: 'Mulai Rp150.000'),
+          if (_MitraScope.of(context).services case final services?)
+            if (services.isEmpty)
+              Text(
+                'Belum ada harga layanan.',
+                style: pj(fontSize: 13, color: AppColors.muted),
+              )
+            else
+              for (final s in services)
+                _PriceRow(
+                  label: s['service_name'] as String? ?? '-',
+                  value: s['price_max'] == null
+                      ? 'Mulai ${rupiah(s['price_min'] as num? ?? 0)}'
+                      : '${rupiah(s['price_min'] as num? ?? 0)}-${rupiah(s['price_max'] as num)}',
+                )
+          else ...const [
+            _PriceRow(label: 'Cuci AC', value: 'Rp80.000-Rp120.000'),
+            _PriceRow(label: 'Cek AC bocor', value: 'Rp100.000-Rp150.000'),
+            _PriceRow(label: 'Isi freon', value: 'Mulai Rp150.000'),
+          ],
           const SizedBox(height: 12),
           BrButton(
             label: 'Atur Harga',
@@ -1761,8 +2146,11 @@ class _NoOrdersEmptyState extends StatelessWidget {
 }
 
 class _ScheduleTab extends StatelessWidget {
+  const _ScheduleTab();
+
   @override
   Widget build(BuildContext context) {
+    final mitra = _MitraScope.of(context);
     return _MitraScrollView(
       children: [
         const _SimpleTitle(
@@ -1773,24 +2161,20 @@ class _ScheduleTab extends StatelessWidget {
         _ScheduleCard(onTap: () {}),
         const SectionTitle('Pengaturan Jam Kerja'),
         BrCard(
+          padding: EdgeInsets.zero,
           child: Column(
-            children: const [
-              _ProfileMenuRow(
-                icon: Icons.event_available_rounded,
-                title: 'Senin-Jumat',
-                subtitle: '08.00-18.00',
-              ),
-              _ProfileMenuRow(
-                icon: Icons.weekend_rounded,
-                title: 'Sabtu',
-                subtitle: '09.00-15.00',
-              ),
-              _ProfileMenuRow(
-                icon: Icons.block_rounded,
-                title: 'Minggu',
-                subtitle: 'Tidak menerima order',
-                last: true,
-              ),
+            children: [
+              for (final day in _weekDays)
+                if (_scheduleLabel(mitra.schedules, day) case final hours)
+                  _ProfileMenuRow(
+                    icon: hours == null
+                        ? Icons.block_rounded
+                        : Icons.event_available_rounded,
+                    title: day,
+                    subtitle: hours ?? 'Libur · tidak menerima order',
+                    last: day == _weekDays.last,
+                    onTap: () => mitra.editScheduleDay(day),
+                  ),
             ],
           ),
         ),
@@ -1807,6 +2191,11 @@ class _MitraProfileTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final mitra = _MitraScope.of(context);
+    final workDays = [
+      for (final d in _weekDays)
+        if (_scheduleLabel(mitra.schedules, d) != null) d,
+    ];
     return _MitraScrollView(
       children: [
         const _SimpleTitle(
@@ -1820,14 +2209,14 @@ class _MitraProfileTab extends StatelessWidget {
             children: [
               Row(
                 children: [
-                  const Avatar(name: 'Pak Rudi AC', size: 60),
+                  Avatar(name: mitra.displayName, size: 60),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Pak Rudi AC',
+                          mitra.displayName,
                           style: pj(
                             fontSize: 18,
                             fontWeight: FontWeight.w900,
@@ -1835,9 +2224,16 @@ class _MitraProfileTab extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(height: 5),
-                        const Stars(value: 4.9, size: 12),
+                        Stars(value: mitra.rating, size: 12),
                         const SizedBox(height: 6),
-                        const BrTag(label: 'Terverifikasi', color: 'success'),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            for (final b in mitra.badges)
+                              BrTag(label: b, color: 'success'),
+                          ],
+                        ),
                       ],
                     ),
                   ),
@@ -1845,7 +2241,7 @@ class _MitraProfileTab extends StatelessWidget {
               ),
               const SizedBox(height: 14),
               Text(
-                'Teknisi AC area Tebet dengan pengalaman 7 tahun. Fokus cuci AC, AC bocor, isi freon, dan perawatan rutin rumah.',
+                mitra.bio,
                 style: pj(fontSize: 13, color: AppColors.ink2, height: 1.45),
               ),
               const SizedBox(height: 14),
@@ -1884,10 +2280,13 @@ class _MitraProfileTab extends StatelessWidget {
                 title: 'Working area',
                 subtitle: 'Tebet, Manggarai, Pancoran',
               ),
-              const _ProfileMenuRow(
+              _ProfileMenuRow(
                 icon: Icons.schedule_outlined,
                 title: 'Working hours',
-                subtitle: 'Senin-Sabtu, 08.00-18.00',
+                subtitle: workDays.isEmpty
+                    ? 'Belum diatur'
+                    : workDays.join(', '),
+                onTap: () => onAction('Atur jam kerja di tab Jadwal.'),
               ),
               const _ProfileMenuRow(
                 icon: Icons.photo_library_outlined,
@@ -1909,6 +2308,31 @@ class _MitraProfileTab extends StatelessWidget {
                 title: 'Account settings',
                 subtitle: 'Nomor HP, PIN, dan notifikasi',
                 last: true,
+              ),
+            ],
+          ),
+        ),
+        const SectionTitle('Balasan Cepat'),
+        BrCard(
+          padding: EdgeInsets.zero,
+          child: Column(
+            children: [
+              for (final r in mitra.quickReplies)
+                _ProfileMenuRow(
+                  icon: Icons.quickreply_outlined,
+                  title: r['title'] as String? ?? '',
+                  subtitle: r['body'] as String? ?? '',
+                  onTap: () => mitra.openQuickReply(r),
+                ),
+              Padding(
+                padding: const EdgeInsets.all(14),
+                child: BrButton(
+                  label: 'Tambah Balasan',
+                  full: true,
+                  variant: BrButtonVariant.secondary,
+                  icon: const Icon(Icons.add_rounded, size: 18),
+                  onPressed: () => mitra.editQuickReply(),
+                ),
               ),
             ],
           ),

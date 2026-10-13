@@ -19,6 +19,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _phone = '';
   int _bookingCount = 0;
   int _workerCount = 0;
+  bool _isAdmin = false;
 
   @override
   void initState() {
@@ -27,8 +28,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   void _loadUserData() {
-    final user = Supabase.instance.client.auth.currentUser;
+    final SupabaseClient client;
+    try {
+      client = Supabase.instance.client;
+    } catch (_) {
+      return; // demo tanpa Supabase
+    }
+    final user = client.auth.currentUser;
     if (user == null) return;
+    client
+        .from('users')
+        .select('role')
+        .eq('user_id', user.id)
+        .maybeSingle()
+        .then((row) {
+          if (mounted && row?['role'] == 'admin') {
+            setState(() => _isAdmin = true);
+          }
+        })
+        .catchError((_) => null);
     final meta = user.userMetadata ?? {};
     final rawName =
         (meta['full_name'] ?? meta['name'] ?? user.email ?? '').toString().trim();
@@ -209,6 +227,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
                 const SizedBox(height: 12),
                 _RoleSwitcherCard(isWorkerMode: widget.isWorkerMode, go: widget.go),
+                if (_isAdmin) ...[
+                  const SizedBox(height: 12),
+                  BrButton(
+                    label: 'Panel Admin',
+                    full: true,
+                    variant: BrButtonVariant.secondary,
+                    icon: const Icon(Icons.admin_panel_settings_outlined, size: 18),
+                    onPressed: () => widget.go('admin'),
+                  ),
+                ],
                 const SectionTitle('Akun'),
                 _MenuList(items: account, go: widget.go),
                 const SectionTitle('Bantuan'),

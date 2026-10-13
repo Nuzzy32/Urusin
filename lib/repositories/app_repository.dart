@@ -186,9 +186,10 @@ class HybridBeresinRepository implements BeresinRepository {
     if (booking != null) {
       _bookings[bookingId] = booking.copyWith(status: BookingStatus.disputed);
       unawaited(
-        _supabase?.from('bookings').update({
-          'status': BookingStatus.disputed.value,
-        }).eq('id', bookingId) ??
+        _supabase
+                ?.from('bookings')
+                .update({'status': BookingStatus.disputed.value})
+                .eq('id', bookingId) ??
             Future<void>.value(),
       );
     }
@@ -207,10 +208,10 @@ class HybridBeresinRepository implements BeresinRepository {
     final userMeta = _supabase?.auth.currentUser?.userMetadata ?? {};
     final userName =
         ((userMeta['full_name'] ?? userMeta['name'] ?? '') as String)
-                .trim()
-                .isNotEmpty
-            ? (userMeta['full_name'] ?? userMeta['name']).toString().trim()
-            : 'Customer Beresin';
+            .trim()
+            .isNotEmpty
+        ? (userMeta['full_name'] ?? userMeta['name']).toString().trim()
+        : 'Customer Beresin';
     final review = Review(
       id: _id('review'),
       workerId: workerId,
@@ -246,22 +247,46 @@ class HybridBeresinRepository implements BeresinRepository {
     WorkerApplication draft,
   ) async {
     _workerApplications[draft.id] = draft;
-    unawaited(_upsert('worker_applications', draft.toJson()));
-    for (final row in draft.servicesToRows()) {
-      unawaited(_upsert('worker_application_services', row));
+    final client = _supabase;
+    if (client == null) return draft; // demo/test tanpa Supabase
+
+    final uid = client.auth.currentUser?.id;
+    if (uid == null) throw StateError('Silakan masuk dulu sebelum mendaftar.');
+
+    // FK worker_applications.user_id butuh baris users; biasanya sudah dibuat saat login.
+    await client
+        .from('users')
+        .upsert(
+          {
+            'auth_user_id': uid,
+            'name': draft.fullName,
+            'phone_number': draft.whatsapp,
+          },
+          onConflict: 'auth_user_id',
+          ignoreDuplicates: true,
+        );
+
+    // Tulis sebagai draft dulu → anak-anaknya → baru pending, supaya admin
+    // tidak pernah melihat pendaftaran setengah jadi. Aman di-retry (id stabil).
+    await client.from('worker_applications').upsert({
+      ...draft.toJson(),
+      'status': WorkerVerificationStatus.draft.value,
+    });
+    final children = {
+      'worker_application_services': draft.servicesToRows(),
+      'worker_application_areas': draft.areasToRows(),
+      'worker_application_schedules': draft.schedulesToRows(),
+      'worker_application_prices': draft.pricesToRows(),
+      'worker_application_portfolios': draft.portfoliosToRows(),
+    };
+    for (final MapEntry(key: table, value: rows) in children.entries) {
+      await client.from(table).delete().eq('application_id', draft.id);
+      if (rows.isNotEmpty) await client.from(table).insert(rows);
     }
-    for (final row in draft.areasToRows()) {
-      unawaited(_upsert('worker_application_areas', row));
-    }
-    for (final row in draft.schedulesToRows()) {
-      unawaited(_upsert('worker_application_schedules', row));
-    }
-    for (final row in draft.pricesToRows()) {
-      unawaited(_upsert('worker_application_prices', row));
-    }
-    for (final row in draft.portfoliosToRows()) {
-      unawaited(_upsert('worker_application_portfolios', row));
-    }
+    await client
+        .from('worker_applications')
+        .update({'status': draft.status.value})
+        .eq('id', draft.id);
     return draft;
   }
 

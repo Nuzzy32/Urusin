@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Beresin memakai kamera untuk foto kerusakan, selfie verifikasi, dan bukti pekerjaan.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Beresin membuka galeri untuk memilih foto kerusakan, KTP, dan portofolio pekerjaan.</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>

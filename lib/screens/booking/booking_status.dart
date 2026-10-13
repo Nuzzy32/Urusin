@@ -444,10 +444,8 @@ Future<List<String>> _uploadComplaintEvidence(
             bytes,
             fileOptions: const FileOptions(upsert: false),
           );
-      uploaded.add(
-        client.storage.from('complaint-evidence').createSignedUrl(path, 60 * 60 * 24 * 30)
-            as String? ?? path,
-      );
+      // Simpan object path; admin membuat signed URL saat butuh (bucket privat).
+      uploaded.add(path);
     } catch (_) {
       // skip file yang gagal
     }

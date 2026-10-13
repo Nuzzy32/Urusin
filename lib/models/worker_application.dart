@@ -102,8 +102,9 @@ class WorkerApplication {
       {
         'application_id': id,
         'day_name': d,
-        'start_time': startTime,
-        'end_time': endTime,
+        // UI pakai '08.00'; Postgres time butuh '08:00'.
+        'start_time': startTime.replaceAll('.', ':'),
+        'end_time': endTime.replaceAll('.', ':'),
       },
   ];
 

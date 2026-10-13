@@ -110,17 +110,13 @@ void main() {
         findsOneWidget,
       );
 
-      await scrollTo(find.text('Upload KTP').last);
-      await tester.tap(find.text('Upload KTP').last);
-      await tester.pump(const Duration(milliseconds: 600));
-      await tester.pumpAndSettle();
-      await scrollTo(find.text('Buka Kamera'));
-      await tester.tap(find.text('Buka Kamera'));
-      await tester.pump(const Duration(milliseconds: 600));
-      await tester.pumpAndSettle();
-      await scrollTo(find.text('Upload Foto'));
-      await tester.tap(find.text('Upload Foto'));
-      await tester.pumpAndSettle();
+      // Image picker butuh plugin native; di test, isi hasil unggah langsung.
+      mitraDraft
+        ..ktp = UploadState.uploaded
+        ..ktpPath = 'local/ktp.jpg'
+        ..selfie = UploadState.uploaded
+        ..selfiePath = 'local/selfie.jpg'
+        ..portfolioPaths.addAll(['local/portfolio-1.jpg', 'local/portfolio-2.jpg']);
       appRouter.go('/onboarding/worker/review');
       await tester.pumpAndSettle();
       expect(find.text('Review Pendaftaran'), findsOneWidget);

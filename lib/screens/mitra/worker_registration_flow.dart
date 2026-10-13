@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../models.dart';
 import '../../repositories/app_repository.dart';
@@ -44,7 +47,11 @@ class MitraRegistrationDraft {
 
   UploadState ktp = UploadState.empty;
   UploadState selfie = UploadState.empty;
-  int workPhotos = 0;
+  String? applicationId;
+  String ktpPath = '';
+  String selfiePath = '';
+  final List<String> portfolioPaths = [];
+  int get workPhotos => portfolioPaths.length;
   String referenceName = '';
   String referencePhone = '';
   String referenceNote = '';
@@ -226,14 +233,12 @@ class _MitraDataDiriScreenState extends State<MitraDataDiriScreen> {
           emptyText: 'Upload foto wajah atau logo usaha',
           uploadedText: 'Foto profil siap ditampilkan',
           buttonText: 'Upload Foto',
-          onUpload: () => _simulateUpload(
-            onProgress: () =>
-                setState(() => mitraDraft.profilePhoto = UploadState.uploading),
-            onDone: () =>
-                setState(() => mitraDraft.profilePhoto = UploadState.uploaded),
+          onUpload: () => _uploadInto(
+            context: context,
+            setState: setState,
+            name: 'profile',
+            apply: (state, _) => mitraDraft.profilePhoto = state,
           ),
-          onFail: () =>
-              setState(() => mitraDraft.profilePhoto = UploadState.tooLarge),
         ),
         if (submitted && mitraDraft.profilePhoto != UploadState.uploaded)
           const _InlineError('Foto profil wajib diunggah.'),
@@ -786,6 +791,7 @@ class _MitraVerifikasiScreenState extends State<MitraVerifikasiScreen> {
   late final refPhone = TextEditingController(text: mitraDraft.referencePhone);
   late final refNote = TextEditingController(text: mitraDraft.referenceNote);
   bool submitted = false;
+  bool _portfolioBusy = false;
 
   @override
   void initState() {
@@ -827,12 +833,15 @@ class _MitraVerifikasiScreenState extends State<MitraVerifikasiScreen> {
           emptyText: 'Upload foto KTP',
           uploadedText: 'KTP berhasil diunggah',
           buttonText: 'Upload KTP',
-          onUpload: () => _simulateUpload(
-            onProgress: () =>
-                setState(() => mitraDraft.ktp = UploadState.uploading),
-            onDone: () => setState(() => mitraDraft.ktp = UploadState.uploaded),
+          onUpload: () => _uploadInto(
+            context: context,
+            setState: setState,
+            name: 'ktp',
+            apply: (state, path) {
+              mitraDraft.ktp = state;
+              if (path != null) mitraDraft.ktpPath = path;
+            },
           ),
-          onFail: () => setState(() => mitraDraft.ktp = UploadState.blurry),
         ),
         _UploadActionCard(
           title: 'Selfie wajah',
@@ -841,13 +850,16 @@ class _MitraVerifikasiScreenState extends State<MitraVerifikasiScreen> {
           emptyText: 'Ambil selfie wajah',
           uploadedText: 'Selfie berhasil diunggah',
           buttonText: 'Buka Kamera',
-          onUpload: () => _simulateUpload(
-            onProgress: () =>
-                setState(() => mitraDraft.selfie = UploadState.uploading),
-            onDone: () =>
-                setState(() => mitraDraft.selfie = UploadState.uploaded),
+          onUpload: () => _uploadInto(
+            context: context,
+            setState: setState,
+            name: 'selfie',
+            source: ImageSource.camera,
+            apply: (state, path) {
+              mitraDraft.selfie = state;
+              if (path != null) mitraDraft.selfiePath = path;
+            },
           ),
-          onFail: () => setState(() => mitraDraft.selfie = UploadState.failed),
         ),
         BrCard(
           padding: const EdgeInsets.all(14),
@@ -875,14 +887,12 @@ class _MitraVerifikasiScreenState extends State<MitraVerifikasiScreen> {
         const SizedBox(height: 12),
         _WorkPhotoCard(
           count: mitraDraft.workPhotos,
-          onUpload: () => setState(
-            () =>
-                mitraDraft.workPhotos = (mitraDraft.workPhotos + 2).clamp(0, 4),
-          ),
-          onFail: () => _showMitraToast(
-            context,
-            'Upload gagal. Coba lagi atau pilih foto lain.',
-          ),
+          busy: _portfolioBusy,
+          onUpload: () async {
+            setState(() => _portfolioBusy = true);
+            await _addPortfolioPhotos(context);
+            if (mounted) setState(() => _portfolioBusy = false);
+          },
         ),
         const SectionTitle('Referensi pelanggan'),
         _OptionalField(
@@ -1061,22 +1071,40 @@ class MitraSubmittingScreen extends StatefulWidget {
 class _MitraSubmittingScreenState extends State<MitraSubmittingScreen> {
   int step = 0;
   Timer? timer;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    unawaited(
-      appRepository.submitWorkerApplication(_workerApplicationFromDraft()),
-    );
+    _submit();
+  }
+
+  Future<void> _submit() async {
+    setState(() {
+      step = 0;
+      _error = null;
+    });
+    // Timer hanya animasi; navigasi menunggu submit benar-benar selesai.
+    timer?.cancel();
     timer = Timer.periodic(const Duration(milliseconds: 650), (timer) {
-      if (!mounted) return;
-      if (step >= 3) {
-        timer.cancel();
-        widget.go('workerSubmitted');
-        return;
-      }
+      if (!mounted || step >= 3) return timer.cancel();
       setState(() => step++);
     });
+    try {
+      await Future.wait([
+        appRepository.submitWorkerApplication(_workerApplicationFromDraft()),
+        Future<void>.delayed(const Duration(milliseconds: 2600)),
+      ]);
+      if (mounted) widget.go('workerSubmitted');
+    } catch (e) {
+      timer?.cancel();
+      if (!mounted) return;
+      setState(
+        () => _error = e is StateError
+            ? e.message
+            : 'Pendaftaran gagal dikirim. Cek koneksi lalu coba lagi.',
+      );
+    }
   }
 
   @override
@@ -1129,12 +1157,24 @@ class _MitraSubmittingScreenState extends State<MitraSubmittingScreen> {
                   return _ProgressRow(
                     title: steps[index],
                     active: index <= step,
-                    loading: index == step,
+                    loading: _error == null && index == step,
                     border: index < steps.length - 1,
                   );
                 }),
               ),
             ),
+            if (_error != null) ...[
+              _InlineError(_error!),
+              const SizedBox(height: 16),
+              BrButton(label: 'Coba Lagi', full: true, onPressed: _submit),
+              const SizedBox(height: 8),
+              BrButton(
+                label: 'Kembali ke Ringkasan',
+                full: true,
+                variant: BrButtonVariant.secondary,
+                onPressed: () => widget.go('workerReview'),
+              ),
+            ],
           ],
         ),
       ),
@@ -1609,7 +1649,6 @@ class _UploadActionCard extends StatelessWidget {
   final String uploadedText;
   final String buttonText;
   final VoidCallback onUpload;
-  final VoidCallback onFail;
 
   const _UploadActionCard({
     required this.title,
@@ -1619,7 +1658,6 @@ class _UploadActionCard extends StatelessWidget {
     required this.uploadedText,
     required this.buttonText,
     required this.onUpload,
-    required this.onFail,
   });
 
   @override
@@ -1654,7 +1692,7 @@ class _UploadActionCard extends StatelessWidget {
                       children: [
                         Text(
                           isUploading
-                              ? 'Mengunggah... 65%'
+                              ? 'Mengunggah...'
                               : isUploaded
                               ? uploadedText
                               : emptyText,
@@ -1682,34 +1720,17 @@ class _UploadActionCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(99),
                   child: const LinearProgressIndicator(
                     minHeight: 7,
-                    value: .65,
                     color: AppColors.primary,
                     backgroundColor: AppColors.line,
                   ),
                 ),
               ],
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: BrButton(
-                      label: isUploaded ? 'Ganti' : buttonText,
-                      full: true,
-                      size: BrButtonSize.sm,
-                      onPressed: onUpload,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: BrButton(
-                      label: 'Simulasi error',
-                      full: true,
-                      size: BrButtonSize.sm,
-                      variant: BrButtonVariant.secondary,
-                      onPressed: onFail,
-                    ),
-                  ),
-                ],
+              BrButton(
+                label: isUploaded ? 'Ganti' : buttonText,
+                full: true,
+                size: BrButtonSize.sm,
+                onPressed: isUploading ? null : onUpload,
               ),
             ],
           ),
@@ -1744,13 +1765,13 @@ class _UploadPreview extends StatelessWidget {
 
 class _WorkPhotoCard extends StatelessWidget {
   final int count;
+  final bool busy;
   final VoidCallback onUpload;
-  final VoidCallback onFail;
 
   const _WorkPhotoCard({
     required this.count,
+    required this.busy,
     required this.onUpload,
-    required this.onFail,
   });
 
   @override
@@ -1811,27 +1832,11 @@ class _WorkPhotoCard extends StatelessWidget {
             ),
           ],
           const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: BrButton(
-                  label: 'Upload Foto',
-                  full: true,
-                  size: BrButtonSize.sm,
-                  onPressed: onUpload,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: BrButton(
-                  label: 'Simulasi gagal',
-                  full: true,
-                  size: BrButtonSize.sm,
-                  variant: BrButtonVariant.secondary,
-                  onPressed: onFail,
-                ),
-              ),
-            ],
+          BrButton(
+            label: busy ? 'Mengunggah...' : 'Upload Foto',
+            full: true,
+            size: BrButtonSize.sm,
+            onPressed: busy || count >= _maxPortfolio ? null : onUpload,
           ),
         ],
       ),
@@ -2431,7 +2436,9 @@ String _priceSummary(String service) {
 WorkerApplication _workerApplicationFromDraft() {
   final now = DateTime.now();
   return WorkerApplication(
-    id: 'worker-application-${now.microsecondsSinceEpoch}',
+    // Id stabil supaya "Coba Lagi" menimpa pendaftaran yang sama.
+    id: mitraDraft.applicationId ??=
+        'worker-application-${now.microsecondsSinceEpoch}',
     fullName: mitraDraft.fullName,
     businessName: mitraDraft.businessName,
     whatsapp: mitraDraft.whatsapp,
@@ -2445,16 +2452,9 @@ WorkerApplication _workerApplicationFromDraft() {
     endTime: mitraDraft.endTime,
     priceFrom: Map<String, String>.from(mitraDraft.priceFrom),
     priceTo: Map<String, String>.from(mitraDraft.priceTo),
-    ktpAssetPath: mitraDraft.ktp == UploadState.uploaded
-        ? 'worker-verification/local/ktp.jpg'
-        : '',
-    selfieAssetPath: mitraDraft.selfie == UploadState.uploaded
-        ? 'worker-verification/local/selfie.jpg'
-        : '',
-    portfolioAssetPaths: List.generate(
-      mitraDraft.workPhotos,
-      (index) => 'worker-verification/local/portfolio-${index + 1}.jpg',
-    ),
+    ktpAssetPath: mitraDraft.ktpPath,
+    selfieAssetPath: mitraDraft.selfiePath,
+    portfolioAssetPaths: List.of(mitraDraft.portfolioPaths),
     status: WorkerVerificationStatus.pending,
     createdAt: now,
     updatedAt: now,
@@ -2472,13 +2472,100 @@ String _daysSummary() {
   return days.join(', ');
 }
 
-Future<void> _simulateUpload({
-  required VoidCallback onProgress,
-  required VoidCallback onDone,
+const _maxUploadBytes = 5 * 1024 * 1024; // = file_size_limit bucket
+const _maxPortfolio = 6;
+
+class _NotSignedIn implements Exception {}
+
+/// Unggah ke bucket privat `worker-verification/<uid>/<name>.<ext>` dan
+/// kembalikan object path-nya. Tanpa Supabase (demo/test) → path lokal.
+Future<String> _uploadVerificationFile(
+  String name,
+  XFile file,
+  Uint8List bytes,
+) async {
+  final ext = file.name.contains('.')
+      ? file.name.split('.').last.toLowerCase()
+      : 'jpg';
+  final SupabaseClient client;
+  try {
+    client = Supabase.instance.client;
+  } catch (_) {
+    return 'local/$name.$ext';
+  }
+  final uid = client.auth.currentUser?.id;
+  if (uid == null) throw _NotSignedIn();
+  final path = '$uid/$name.$ext';
+  await client.storage
+      .from('worker-verification')
+      .uploadBinary(
+        path,
+        bytes,
+        fileOptions: FileOptions(
+          upsert: true,
+          contentType: file.mimeType ?? 'image/${ext == 'jpg' ? 'jpeg' : ext}',
+        ),
+      );
+  return path;
+}
+
+String _uploadErrorText(Object error) => error is _NotSignedIn
+    ? 'Masuk dulu ke akun Beresin sebelum mengunggah dokumen.'
+    : 'Upload gagal. Cek koneksi lalu coba lagi.';
+
+Future<void> _uploadInto({
+  required BuildContext context,
+  required StateSetter setState,
+  required String name,
+  required void Function(UploadState state, String? path) apply,
+  ImageSource source = ImageSource.gallery,
 }) async {
-  onProgress();
-  await Future<void>.delayed(const Duration(milliseconds: 450));
-  onDone();
+  final file = await ImagePicker().pickImage(
+    source: source,
+    imageQuality: 80,
+    maxWidth: 1600,
+  );
+  if (file == null || !context.mounted) return;
+  setState(() => apply(UploadState.uploading, null));
+  try {
+    final bytes = await file.readAsBytes();
+    if (bytes.length > _maxUploadBytes) {
+      if (context.mounted) setState(() => apply(UploadState.tooLarge, null));
+      return;
+    }
+    final path = await _uploadVerificationFile(name, file, bytes);
+    if (context.mounted) setState(() => apply(UploadState.uploaded, path));
+  } catch (e) {
+    if (!context.mounted) return;
+    setState(() => apply(UploadState.failed, null));
+    _showMitraToast(context, _uploadErrorText(e));
+  }
+}
+
+Future<void> _addPortfolioPhotos(BuildContext context) async {
+  final files = await ImagePicker().pickMultiImage(
+    imageQuality: 80,
+    maxWidth: 1600,
+  );
+  for (final file in files) {
+    if (mitraDraft.portfolioPaths.length >= _maxPortfolio) break;
+    try {
+      final bytes = await file.readAsBytes();
+      if (bytes.length > _maxUploadBytes) {
+        if (context.mounted) {
+          _showMitraToast(context, '${file.name} lebih dari 5 MB, dilewati.');
+        }
+        continue;
+      }
+      final n = mitraDraft.portfolioPaths.length + 1;
+      mitraDraft.portfolioPaths.add(
+        await _uploadVerificationFile('portfolio-$n', file, bytes),
+      );
+    } catch (e) {
+      if (context.mounted) _showMitraToast(context, _uploadErrorText(e));
+      return;
+    }
+  }
 }
 
 void _showMitraToast(BuildContext context, String message) {
